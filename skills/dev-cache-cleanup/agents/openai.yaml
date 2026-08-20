@@ -1,0 +1,4 @@
+interface:
+  display_name: "Dev Cache Cleanup"
+  short_description: "Safely reclaim macOS developer cache disk space"
+  default_prompt: "Use $dev-cache-cleanup to scan and safely reclaim developer cache space on this Mac."

@@ -1,0 +1,18 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  zsh:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Syntax check
+        run: zsh -n bin/clear-dev-caches lib/*.zsh tests/run.zsh install.sh
+      - name: Test
+        run: zsh tests/run.zsh
