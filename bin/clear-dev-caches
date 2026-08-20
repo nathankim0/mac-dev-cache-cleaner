@@ -15,7 +15,7 @@ Usage:
   clear-dev-caches [scan] [options]
   clear-dev-caches clean [options]
   clear-dev-caches trash-status
-  clear-dev-caches empty-trash [--yes] [--restart-finder]
+  clear-dev-caches empty-trash [--user-approved] [--restart-finder]
 
 The default command is a read-only project-artifact scan. Nothing is removed
 unless the `clean` command is given and the plan is confirmed.
@@ -38,7 +38,8 @@ Discovery and safety:
   --include-recent     Allow recently active project artifacts in a clean plan
   --trash              Move path-based artifacts to Trash (default)
   --permanent          Permanently remove selected path-based artifacts
-  --yes, -y            Skip the interactive confirmation
+  --user-approved      Assert that the user approved this exact displayed plan
+  --yes, -y            Legacy alias for --user-approved
   --empty-trash        Ask Finder to empty Trash after a successful clean
   --restart-finder     Retry an explicit empty-trash command after restarting Finder
   --version            Print version
@@ -113,7 +114,15 @@ while (( $# > 0 )); do
     --include-recent) include_recent=1 ;;
     --trash) DEVCLEAN_DELETE_MODE="trash" ;;
     --permanent) DEVCLEAN_DELETE_MODE="permanent" ;;
-    --yes|-y) DEVCLEAN_ASSUME_YES=1 ;;
+    --user-approved)
+      DEVCLEAN_USER_APPROVED=1
+      DEVCLEAN_APPROVAL_SOURCE="--user-approved"
+      ;;
+    --yes|-y)
+      DEVCLEAN_USER_APPROVED=1
+      DEVCLEAN_APPROVAL_SOURCE="legacy --yes"
+      devclean_warn "--yes is a legacy alias; prefer --user-approved after the user reviews the scan"
+      ;;
     --empty-trash) empty_trash=1 ;;
     --restart-finder) restart_finder=1 ;;
     --dry-run) command_mode="scan" ;;
@@ -129,6 +138,8 @@ if [[ "$command_mode" == "trash-status" ]]; then
   exit $?
 fi
 if [[ "$command_mode" == "empty-trash" ]]; then
+  devclean_trash_status || exit 1
+  (( restart_finder )) && devclean_warn "the approved action will restart Finder if the first empty attempt fails"
   devclean_confirm "Empty Trash permanently?" || { devclean_info "Cancelled."; exit 1; }
   devclean_empty_trash "$restart_finder"
   exit $?
@@ -220,7 +231,12 @@ fi
 typeset mode_note="move to Trash"
 [[ "$DEVCLEAN_DELETE_MODE" == "permanent" ]] && mode_note="permanently remove"
 devclean_info "Selected $selected_count actions, up to $(devclean_format_kb "$selected_kb") ($mode_note for path artifacts)."
-devclean_confirm "Continue?" || { devclean_info "Cancelled."; exit 1; }
+(( select_colima )) && devclean_warn "Colima cleanup preserves volumes but removes stopped containers, unused images, networks, and build cache"
+(( select_android_avd )) && devclean_warn "Android AVD cleanup resets emulator user data and snapshots"
+(( select_temp )) && devclean_warn "temporary-file cleanup permanently targets old entries in the exact current-user TMPDIR"
+[[ "$DEVCLEAN_DELETE_MODE" == "permanent" ]] && devclean_warn "permanent mode cannot be undone"
+(( empty_trash )) && devclean_warn "the approved plan also empties all items currently in Trash"
+devclean_confirm "Apply exactly this cleanup plan?" || { devclean_info "Cancelled."; exit 1; }
 
 DEVCLEAN_DRY_RUN=0
 integer before_free after_free successes=0 failures=0

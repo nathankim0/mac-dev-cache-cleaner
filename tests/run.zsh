@@ -85,7 +85,12 @@ assert_not_contains "ignores same-named folders outside projects" "$output" "$fi
 assert_not_contains "prunes hidden global tool caches from project discovery" "$output" "$fixture_home/.npm"
 assert_contains "recent projects are scan-only by default" "$output" "recent (skip)"
 
-output="$(HOME="$fixture_home" "$cli" clean --root "$fixture_home" --projects --include-recent --permanent --yes 2>&1 || true)"
+output="$(HOME="$fixture_home" "$cli" clean --root "$fixture_home" --projects --include-recent --permanent 2>&1 || true)"
+assert_contains "non-interactive cleanup requires user approval" "$output" "requires one user confirmation"
+assert_exists "unapproved cleanup preserves node_modules" "$fixture_home/work/app/node_modules"
+assert_exists "unapproved cleanup preserves build output" "$fixture_home/work/app/build"
+
+output="$(HOME="$fixture_home" "$cli" clean --root "$fixture_home" --projects --include-recent --permanent --user-approved 2>&1 || true)"
 if [[ -e "$fixture_home/work/app/node_modules" || -e "$fixture_home/work/app/build" ]]; then
   print -u2 -r -- "$output"
 fi
@@ -158,6 +163,9 @@ fi
 /bin/mkdir -p "$fixture_home/.Trash/sample"
 output="$(HOME="$fixture_home" "$cli" trash-status 2>&1)"
 assert_contains "Trash status is read-only and reports contents" "$output" "1 top-level items"
+output="$(HOME="$fixture_home" "$cli" empty-trash 2>&1 || true)"
+assert_contains "non-interactive Trash empty requires user approval" "$output" "requires one user confirmation"
+assert_exists "unapproved Trash empty preserves contents" "$fixture_home/.Trash/sample"
 
 print -r -- ""
 print -r -- "$passed passed, $failed failed"
