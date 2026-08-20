@@ -56,6 +56,8 @@ clear-dev-caches clean --root "$HOME/Developer" --projects --permanent
 clear-dev-caches clean --shorebird --android --colima
 ```
 
+Every mutating command asks for confirmation after displaying the exact plan. Agents and wrappers may use `--user-approved` only after showing that plan and receiving an explicit user approval; it prevents a duplicate shell prompt, not the approval step itself. The older `--yes` and `-y` spellings remain compatibility aliases but should not be used in new integrations.
+
 Diagnose or empty a stuck Trash without deleting it directly:
 
 ```sh
@@ -85,6 +87,7 @@ Run `clear-dev-caches --help` for every option.
 ## Safety notes
 
 - A scan is a snapshot. Each target's device, inode, and modification time are checked again before an action.
+- Cleanup and Trash-emptying require one user confirmation. Read-only scans do not.
 - Open path-based targets are skipped.
 - Android package cleanup uses `sdkmanager --uninstall` and is skipped while an emulator is active.
 - Trash mode does not increase free space until Trash is emptied. Pass `--empty-trash` only if that is intended, or use `--permanent` after reviewing the plan.

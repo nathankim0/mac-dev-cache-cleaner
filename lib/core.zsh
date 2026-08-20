@@ -4,10 +4,11 @@ emulate -L zsh
 setopt extended_glob pipe_fail
 
 typeset -g DEVCLEAN_NAME="clear-dev-caches"
-typeset -g DEVCLEAN_VERSION="0.1.0"
+typeset -g DEVCLEAN_VERSION="0.2.0"
 typeset -g DEVCLEAN_DELETE_MODE="trash"
 typeset -g DEVCLEAN_DRY_RUN=1
-typeset -g DEVCLEAN_ASSUME_YES=0
+typeset -g DEVCLEAN_USER_APPROVED=0
+typeset -g DEVCLEAN_APPROVAL_SOURCE="interactive"
 typeset -g DEVCLEAN_LOG_PATH="${XDG_STATE_HOME:-$HOME/.local/state}/mac-dev-cache-cleaner/operations.log"
 
 devclean_info() {
@@ -202,8 +203,14 @@ devclean_delete_target() {
 
 devclean_confirm() {
   local prompt="$1"
-  (( DEVCLEAN_ASSUME_YES )) && return 0
-  [[ -t 0 ]] || { devclean_warn "confirmation requires a terminal; pass --yes after reviewing scan output"; return 1; }
+  if (( DEVCLEAN_USER_APPROVED )); then
+    devclean_info "User approval recorded via $DEVCLEAN_APPROVAL_SOURCE."
+    return 0
+  fi
+  [[ -t 0 ]] || {
+    devclean_warn "cleanup requires one user confirmation; review the scan, then rerun interactively or pass --user-approved"
+    return 1
+  }
   local reply
   read "reply?$prompt [y/N] "
   [[ "$reply" == [yY] ]]
