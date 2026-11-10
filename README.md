@@ -20,6 +20,8 @@ The safety model is inspired by [Mole](https://github.com/tw93/Mole): bounded di
 
 ## Install
 
+Requires macOS, zsh, and Python 3.9 or newer.
+
 ```sh
 git clone https://github.com/nathankim0/mac-dev-cache-cleaner.git
 cd mac-dev-cache-cleaner
@@ -69,29 +71,64 @@ clear-dev-caches empty-trash --restart-finder
 
 Run `clear-dev-caches --help` for every option.
 
+### Save and apply an exact plan
+
+For agent-driven or delayed cleanup, save the selected targets and deletion mode in a private file:
+
+```sh
+clear-dev-caches scan --all --permanent --save-plan "$TMPDIR/developer-cleanup.json"
+clear-dev-caches scan --plan "$TMPDIR/developer-cleanup.json"
+# After reviewing the paths and approving the permanent deletion:
+clear-dev-caches clean --plan "$TMPDIR/developer-cleanup.json" --user-approved
+```
+
+A saved plan never discovers new targets or accepts a different deletion mode. Cleanup rechecks path identity, open files, and tool-specific safety conditions. Changed and in-use targets are skipped, and skipped actions are reported separately from failed actions. Keep Trash emptying separate from a saved plan.
+
+### Inspect a specific temporary folder, Colima profile, or AVD
+
+```sh
+# Only rebuildable project output in a caller-selected, owned tmp/T directory.
+clear-dev-caches scan --temp-projects --temp-root "$HOME/.openclaw/tmp"
+
+# Whole old entries, including test copies/results: separate opt-in.
+clear-dev-caches scan --temp --temp-root "$HOME/.openclaw/tmp" --save-plan "$TMPDIR/old-temp.json"
+
+# Stopped profiles normally show Mac allocation only; this temporarily boots one.
+clear-dev-caches scan --colima-profile build --inspect-stopped-colima --save-plan "$TMPDIR/build-profile.json"
+
+# Reset only the user data and snapshots of the named inactive AVD.
+clear-dev-caches scan --avd old_test_device --save-plan "$TMPDIR/avd-reset.json"
+```
+
+Colima estimates come from Docker's disk-usage inventory, excluding volumes. Intermediate build images are not counted as separate top-level images. A stopped-profile inspection can temporarily resume containers configured to auto-start; it does not change the active Docker context or save new profile settings. Applying a reviewed plan prunes only the selected profiles if their Docker inventory still matches, preserves active containers and all volumes, and restores initially stopped profiles to stopped state. Docker estimates, Mac VM disk allocation, and actual Data-volume free space are reported separately. A successful trim can leave the Mac allocation unchanged; the VM is never recreated to reclaim space.
+
 ## Categories
 
 | Option | Scans | Preserves |
 | --- | --- | --- |
 | `--projects` | `node_modules`, build outputs, `.dart_tool`, `.next`, `target`, Pods, and related artifacts | source, Git data, unmarked lookalike folders, recent projects by default |
-| `--shared` | Gradle, npm, Yarn, pnpm, Bun, CocoaPods, Playwright, node-gyp, and Homebrew caches | project source and credentials |
+| `--temp-projects` | project artifacts inside the current user's TMPDIR or a selected owned temporary root | test source, logs, data, unmarked directories, recent artifacts by default |
+| `--shared` | individual Gradle build/dependency caches, Dart analysis caches, npm, Yarn, pnpm, Bun, CocoaPods, Playwright, node-gyp, and Homebrew | version-specific Gradle state, project source, credentials |
 | `--shorebird` | inactive cached Flutter revisions | active Shorebird Flutter revision |
 | `--xcode` | DerivedData | archives, simulators, signing data |
 | `--android` | older unused system images and NDKs | newest API, AVD images, referenced NDKs |
 | `--colima` | Docker containers, images, networks, build cache, reclaimable VM blocks | Docker volumes and the profile's running/stopped state |
 | `--android-avd-data` | emulator user data, snapshots, caches | AVD definition and base system image |
-| `--temp` | user-owned top-level TMPDIR entries older than the threshold | recent entries and anything outside the exact TMPDIR |
+| `--temp` | old user-owned top-level entries in an owned temporary root | recent/active entries, zero-allocation entries, Git data and credential-like files |
 
 `--all` includes the standard categories but intentionally excludes `--android-avd-data` and `--temp`.
+
+Home discovery also scans `.local/share`, `.openclaw/tmp`, and known Codex artifact, backup, and temporary roots up to 12 levels deep. Known retained cache wrappers in Codex storage do not need a project manifest. The candidates are their build/dependency outputs, not the containing backup, source copy, logs, or database. Directory-scoped project scans do not add these roots. Generic `build`, `dist`, and `target` directories with identifiable mixed evidence are preserved. Project and temporary scans batch size measurements and avoid a process launch per entry.
 
 ## Safety notes
 
 - A scan is a snapshot. Each target's device, inode, and modification time are checked again before an action.
 - Cleanup and Trash-emptying require one user confirmation. Read-only scans do not.
-- Open path-based targets are skipped.
+- Open files and directories are skipped using an open-file inventory refreshed during cleanup. Unreadable paths are not treated as empty.
+- The named AVD must be inactive both during planning and immediately before reset; a running AVD with a different name is preserved.
 - Android package cleanup uses `sdkmanager --uninstall` and is skipped while an emulator is active.
 - Trash mode does not increase free space until Trash is emptied. Pass `--empty-trash` only if that is intended, or use `--permanent` after reviewing the plan.
-- Cache sizes are estimates. Colima and AVD actions preserve some data, so actual reclaimed space can be lower than the displayed footprint.
+- Cache sizes are estimates. Judge space recovery using the Data-volume free space before and after cleanup.
 
 ## Development
 

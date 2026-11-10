@@ -4,7 +4,12 @@ emulate -L zsh
 setopt extended_glob pipe_fail
 
 typeset -g DEVCLEAN_NAME="clear-dev-caches"
-typeset -g DEVCLEAN_VERSION="0.2.0"
+typeset -g DEVCLEAN_VERSION="0.3.0"
+typeset -g DEVCLEAN_LIB_DIR="${${(%):-%x}:A:h}"
+zmodload zsh/stat
+zmodload zsh/datetime
+typeset -gA DEVCLEAN_OPEN_PATHS
+integer -g DEVCLEAN_OPEN_SNAPSHOT=0 DEVCLEAN_TRASHED=0
 typeset -g DEVCLEAN_DELETE_MODE="trash"
 typeset -g DEVCLEAN_DRY_RUN=1
 typeset -g DEVCLEAN_USER_APPROVED=0
@@ -45,7 +50,9 @@ devclean_format_kb() {
 
 devclean_identity() {
   local target_path="$1"
-  /usr/bin/stat -f '%d:%i:%m' "$target_path" 2>/dev/null
+  local -A fs
+  zstat -L -H fs -- "$target_path" 2>/dev/null || return 1
+  print -r -- "${fs[device]}:${fs[inode]}:${fs[mtime]}"
 }
 
 devclean_realpath() {
@@ -82,12 +89,12 @@ devclean_validate_delete_target() {
   [[ -n "$target_path" && -n "$allowed_root" ]] || return 1
   [[ "$target_path" == /* && "$allowed_root" == /* ]] || return 1
   [[ "$target_path" != *$'\n'* && "$target_path" != *$'\r'* && "$target_path" != *$'\t'* ]] || return 1
-  [[ -e "$target_path" && ! -L "$target_path" ]] || return 1
+  [[ -e "$target_path" && ! -L "$target_path" && -O "$target_path" ]] || return 1
   [[ -d "$allowed_root" && ! -L "$allowed_root" ]] || return 1
 
   local resolved_path="${target_path:A}"
   local resolved_root="${allowed_root:A}"
-  [[ "$resolved_path" != "$resolved_root" ]] || return 1
+  [[ "$resolved_path" == "$target_path" && "$resolved_root" == "$allowed_root" && "$resolved_path" != "$resolved_root" ]] || return 1
   devclean_path_within "$resolved_path" "$resolved_root" || return 1
 
   local temp_root=""
@@ -102,7 +109,7 @@ devclean_validate_delete_target() {
   esac
   case "$resolved_path" in
     "$HOME"|"$HOME/Documents"(|/*)|"$HOME/Desktop"(|/*)|"$HOME/Pictures"(|/*)|"$HOME/Movies"(|/*)|"$HOME/Music"(|/*)) return 1 ;;
-    */.git(|/*)|*/.ssh(|/*)|*/.aws(|/*)|*/.gnupg(|/*)) return 1 ;;
+    */.git(|/*)|*/.ssh(|/*)|*/.aws(|/*)|*/.gnupg(|/*)|*/.env(|.*|/*)|*/.Trash(|/*)) return 1 ;;
   esac
   return 0
 }
@@ -118,10 +125,23 @@ devclean_log_operation() {
   local target_path="$3"
   local detail="${4:-}"
   local log_dir="${DEVCLEAN_LOG_PATH:h}"
-  /bin/mkdir -p "$log_dir" 2>/dev/null || return 0
-  /usr/bin/printf '%s\t%s\t%s\t%s\t%s\n' \
-    "$(/bin/date '+%Y-%m-%dT%H:%M:%S%z')" "$operation_status" "$category" "$target_path" "$detail" \
+  [[ -d "$log_dir" ]] || /bin/mkdir -p "$log_dir" 2>/dev/null || return 0
+  local timestamp
+  strftime -s timestamp '%Y-%m-%dT%H:%M:%S%z' "$EPOCHSECONDS"
+  printf '%s\t%s\t%s\t%s\t%s\n' \
+    "$timestamp" "$operation_status" "$category" "$target_path" "$detail" \
     >> "$DEVCLEAN_LOG_PATH" 2>/dev/null || true
+}
+
+devclean_refresh_open_paths() {
+  local snapshot_file="$1" open_path
+  DEVCLEAN_OPEN_SNAPSHOT=0
+  DEVCLEAN_OPEN_PATHS=()
+  python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" open-paths > "$snapshot_file" || return 1
+  while IFS= read -r -d '' open_path; do
+    [[ -n "$open_path" ]] && DEVCLEAN_OPEN_PATHS[$open_path]=1
+  done < "$snapshot_file"
+  DEVCLEAN_OPEN_SNAPSHOT=1
 }
 
 devclean_target_is_open() {
@@ -130,8 +150,16 @@ devclean_target_is_open() {
     [[ ":$DEVCLEAN_TEST_OPEN_PATHS:" == *":$target_path:"* ]]
     return
   fi
-  devclean_command_exists lsof || return 1
-  lsof -n +D "$target_path" >/dev/null 2>&1
+  if (( DEVCLEAN_OPEN_SNAPSHOT )); then
+    [[ -n "${DEVCLEAN_OPEN_PATHS[$target_path]-}" ]]
+    return
+  fi
+  devclean_command_exists lsof || return 0
+  if [[ -d "$target_path" ]]; then
+    lsof -nP +D "$target_path" >/dev/null 2>&1
+  else
+    lsof -nP -- "$target_path" >/dev/null 2>&1
+  fi
 }
 
 devclean_unique_trash_path() {
@@ -151,7 +179,7 @@ devclean_delete_target() {
   if ! devclean_validate_delete_target "$target_path" "$allowed_root"; then
     devclean_warn "refused unsafe target: $target_path"
     devclean_log_operation "REFUSED" "$category" "$target_path" "path-validation"
-    return 1
+    return 2
   fi
 
   local current_identity
@@ -159,13 +187,13 @@ devclean_delete_target() {
   if [[ -z "$current_identity" || "$current_identity" != "$expected_identity" ]]; then
     devclean_warn "target changed since scan; skipped: $target_path"
     devclean_log_operation "SKIPPED" "$category" "$target_path" "identity-changed"
-    return 1
+    return 2
   fi
 
   if devclean_target_is_open "$target_path"; then
     devclean_warn "target is in use; skipped: $target_path"
     devclean_log_operation "SKIPPED" "$category" "$target_path" "in-use"
-    return 1
+    return 2
   fi
 
   if (( DEVCLEAN_DRY_RUN )); then
@@ -176,6 +204,7 @@ devclean_delete_target() {
   if [[ "$DEVCLEAN_DELETE_MODE" == "trash" ]]; then
     if devclean_command_exists trash; then
       if trash "$target_path"; then
+        DEVCLEAN_TRASHED=1
         devclean_log_operation "TRASHED" "$category" "$target_path"
         return 0
       fi
@@ -185,6 +214,7 @@ devclean_delete_target() {
     trash_target="$(devclean_unique_trash_path "$target_path")"
     /bin/mkdir -p "$HOME/.Trash" || return 1
     if /bin/mv "$target_path" "$trash_target"; then
+      DEVCLEAN_TRASHED=1
       devclean_log_operation "TRASHED" "$category" "$target_path" "$trash_target"
       return 0
     fi
@@ -227,8 +257,11 @@ devclean_trash_status() {
     return 0
   }
   local item_count trash_kb
-  item_count="$(/usr/bin/find "$trash_root" -mindepth 1 -maxdepth 1 -print 2>/dev/null | /usr/bin/wc -l | /usr/bin/tr -d ' ')"
-  trash_kb="$(devclean_size_kb "$trash_root")"
+  item_count="$(/usr/bin/find "$trash_root" -mindepth 1 -maxdepth 1 -print0 2>/dev/null | LC_ALL=C /usr/bin/tr -cd '\000' | /usr/bin/wc -c | /usr/bin/tr -d ' ')" &&
+    trash_kb="$(devclean_size_kb "$trash_root")" || {
+      devclean_warn "Trash is unmeasured: macOS denied access or the directory is unreadable"
+      return 1
+    }
   devclean_info "Trash: ${item_count:-0} top-level items, $(devclean_format_kb "$trash_kb")"
   if devclean_target_is_open "$trash_root"; then
     devclean_warn "one or more Trash items are in use"

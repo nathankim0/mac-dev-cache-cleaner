@@ -14,6 +14,7 @@ usage() {
 Usage:
   clear-dev-caches [scan] [options]
   clear-dev-caches clean [options]
+  clear-dev-caches clean --plan FILE [--user-approved]
   clear-dev-caches trash-status
   clear-dev-caches empty-trash [--user-approved] [--restart-finder]
 
@@ -22,17 +23,24 @@ unless the `clean` command is given and the plan is confirmed.
 
 Categories:
   --projects           Auto-discover rebuildable artifacts inside projects (default)
+  --temp-projects      Rebuildable project artifacts in the current user's TMPDIR
   --shared             Shared package/build caches
   --shorebird          Inactive Shorebird Flutter revisions
   --xcode              Xcode DerivedData
   --android            Unused Android system images and NDKs
   --colima             Docker images/containers/build cache; preserves volumes
   --android-avd-data   Emulator user data and snapshots (explicit, aggressive)
-  --temp               Old top-level entries in the current user's TMPDIR
+  --temp               Old entries in an owned temporary root (explicit, aggressive)
   --all                All standard categories (excludes AVD data and temp)
 
 Discovery and safety:
-  --root PATH          Scan root; repeatable (default: $HOME)
+  --root PATH          Project scan root; repeatable (default: $HOME)
+  --temp-root PATH     Owned tmp/T directory for --temp[-projects]; repeatable
+  --colima-profile NAME  Select a Docker profile; repeatable (default: all)
+  --inspect-stopped-colima  Scan only: temporarily start/stop selected stopped VMs
+  --avd NAME           Select one AVD for explicit user-data cleanup; repeatable
+  --save-plan FILE     Save the exact eligible targets and deletion mode (scan)
+  --plan FILE          Apply or display a saved plan without rediscovering targets
   --max-depth N        Maximum project discovery depth (default: 6)
   --age-days N         Recent-project and temp threshold (default: 7)
   --include-recent     Allow recently active project artifacts in a clean plan
@@ -49,7 +57,8 @@ Examples:
   clear-dev-caches
   clear-dev-caches scan --root "$HOME/Developer" --all
   clear-dev-caches clean --root "$HOME/Developer" --projects --permanent
-  clear-dev-caches clean --android --colima
+  clear-dev-caches scan --colima --save-plan /tmp/colima-cleanup.json
+  clear-dev-caches clean --plan /tmp/colima-cleanup.json
 EOF
 }
 
@@ -60,6 +69,7 @@ if (( $# > 0 )) && [[ "$1" == "scan" || "$1" == "clean" || "$1" == "trash-status
 fi
 
 integer select_projects=0
+integer select_temp_projects=0
 integer select_shared=0
 integer select_shorebird=0
 integer select_xcode=0
@@ -73,11 +83,14 @@ integer empty_trash=0
 integer restart_finder=0
 integer max_depth=6
 integer age_days=7
-typeset -ga DEVCLEAN_SCAN_ROOTS=()
+typeset -ga DEVCLEAN_SCAN_ROOTS=() DEVCLEAN_TEMP_ROOTS=() DEVCLEAN_COLIMA_PROFILES=() DEVCLEAN_AVDS=()
+typeset save_plan="" load_plan=""
+integer inspect_stopped_colima=0 override_plan=0
 
 while (( $# > 0 )); do
   case "$1" in
     --projects) select_projects=1; category_was_selected=1 ;;
+    --temp-projects) select_temp_projects=1; category_was_selected=1 ;;
     --shared|--include-shared) select_shared=1; category_was_selected=1 ;;
     --shorebird) select_shorebird=1; category_was_selected=1 ;;
     --xcode) select_xcode=1; category_was_selected=1 ;;
@@ -87,12 +100,34 @@ while (( $# > 0 )); do
     --temp) select_temp=1; category_was_selected=1 ;;
     --all)
       select_projects=1
+      select_temp_projects=1
       select_shared=1
       select_shorebird=1
       select_xcode=1
       select_android=1
       select_colima=1
       category_was_selected=1
+      ;;
+    --save-plan|--plan)
+      (( $# >= 2 )) || { devclean_die "$1 requires a file"; exit 2; }
+      if [[ "$1" == --save-plan ]]; then save_plan="$2"; else load_plan="$2"; fi
+      shift
+      ;;
+    --colima-profile|--avd)
+      (( $# >= 2 )) || { devclean_die "$1 requires a name"; exit 2; }
+      if [[ "$1" == --colima-profile ]]; then
+        DEVCLEAN_COLIMA_PROFILES+=("$2"); select_colima=1
+      else
+        DEVCLEAN_AVDS+=("$2"); select_android_avd=1
+      fi
+      category_was_selected=1
+      shift
+      ;;
+    --inspect-stopped-colima) inspect_stopped_colima=1; select_colima=1; category_was_selected=1 ;;
+    --temp-root)
+      (( $# >= 2 )) || { devclean_die "--temp-root requires a path"; exit 2; }
+      DEVCLEAN_TEMP_ROOTS+=("${2:A}")
+      shift
       ;;
     --root)
       (( $# >= 2 )) || { devclean_die "--root requires a path"; exit 2; }
@@ -103,17 +138,19 @@ while (( $# > 0 )); do
       (( $# >= 2 )) || { devclean_die "--max-depth requires a number"; exit 2; }
       [[ "$2" == <-> && "$2" -ge 1 && "$2" -le 12 ]] || { devclean_die "--max-depth must be 1..12"; exit 2; }
       max_depth="$2"
+      override_plan=1
       shift
       ;;
     --age-days)
       (( $# >= 2 )) || { devclean_die "--age-days requires a number"; exit 2; }
       [[ "$2" == <-> && "$2" -ge 1 && "$2" -le 3650 ]] || { devclean_die "--age-days must be 1..3650"; exit 2; }
       age_days="$2"
+      override_plan=1
       shift
       ;;
     --include-recent) include_recent=1 ;;
-    --trash) DEVCLEAN_DELETE_MODE="trash" ;;
-    --permanent) DEVCLEAN_DELETE_MODE="permanent" ;;
+    --trash) DEVCLEAN_DELETE_MODE="trash"; override_plan=1 ;;
+    --permanent) DEVCLEAN_DELETE_MODE="permanent"; override_plan=1 ;;
     --user-approved)
       DEVCLEAN_USER_APPROVED=1
       DEVCLEAN_APPROVAL_SOURCE="--user-approved"
@@ -133,6 +170,17 @@ while (( $# > 0 )); do
   shift
 done
 
+devclean_command_exists python3 || { devclean_die "Python 3.9 or newer is required"; exit 1; }
+if [[ -n "$load_plan" ]] && (( category_was_selected || include_recent || empty_trash || restart_finder || override_plan || ${#DEVCLEAN_SCAN_ROOTS[@]} || ${#DEVCLEAN_TEMP_ROOTS[@]} )); then
+  devclean_die "--plan uses the saved scope and mode; do not pass discovery or cleanup overrides"
+  exit 2
+fi
+if [[ -n "$save_plan" && ( "$command_mode" != scan || -n "$load_plan" || "$empty_trash" -eq 1 || "$restart_finder" -eq 1 ) ]] ||
+   [[ -n "$load_plan" && "$command_mode" != scan && "$command_mode" != clean ]] ||
+   [[ "$inspect_stopped_colima" -eq 1 && "$command_mode" != scan ]]; then
+  devclean_die "save plans and inspect stopped Colima profiles with scan; keep Trash emptying separate from saved plans"
+  exit 2
+fi
 if [[ "$command_mode" == "trash-status" ]]; then
   devclean_trash_status
   exit $?
@@ -145,18 +193,15 @@ if [[ "$command_mode" == "empty-trash" ]]; then
   exit $?
 fi
 
+if (( ${#DEVCLEAN_TEMP_ROOTS[@]} && !select_temp && !select_temp_projects )); then
+  select_temp_projects=1; category_was_selected=1
+fi
 (( category_was_selected )) || select_projects=1
 (( ${#DEVCLEAN_SCAN_ROOTS[@]} )) || DEVCLEAN_SCAN_ROOTS=("${HOME:A}")
+if (( (select_temp || select_temp_projects) && !${#DEVCLEAN_TEMP_ROOTS[@]} )) && [[ -n "${TMPDIR:-}" ]]; then
+  DEVCLEAN_TEMP_ROOTS=("${TMPDIR:A}")
+fi
 typeset -g DEVCLEAN_MAX_DEPTH="$max_depth"
-
-typeset scan_root
-for scan_root in "${DEVCLEAN_SCAN_ROOTS[@]}"; do
-  if ! devclean_validate_scan_root "$scan_root"; then
-    devclean_die "unsafe or unavailable scan root: $scan_root"
-    exit 2
-  fi
-done
-
 typeset temp_dir
 temp_dir="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/devclean.XXXXXX")" || exit 1
 typeset raw_plan="$temp_dir/raw.tsv"
@@ -171,110 +216,172 @@ cleanup_temp_dir() {
 }
 trap cleanup_temp_dir EXIT INT TERM
 
-if (( select_projects )); then
-  for scan_root in "${DEVCLEAN_SCAN_ROOTS[@]}"; do
-    devclean_emit_artifacts_for_root "$scan_root" "$max_depth" "$age_days" "$raw_plan"
-  done
-fi
-(( select_shared )) && devclean_plan_shared_caches "$raw_plan"
-(( select_shorebird )) && devclean_plan_shorebird "$raw_plan"
-(( select_xcode )) && devclean_plan_xcode "$raw_plan"
-(( select_android )) && devclean_plan_android "$raw_plan"
-(( select_colima )) && devclean_plan_colima "$raw_plan"
-(( select_android_avd )) && devclean_plan_android_avd_data "$raw_plan"
-(( select_temp )) && devclean_plan_temp "$raw_plan" "$age_days"
-
-devclean_deduplicate_plan "$raw_plan" "$plan"
 typeset tab=$'\t'
-LC_ALL=C /usr/bin/sort -t "$tab" -k1,1 -k4,4 "$plan" -o "$plan"
-
-if [[ ! -s "$plan" ]]; then
-  devclean_info "No matching cache artifacts found."
-  exit 0
-fi
-
-integer total_kb=0
-integer selected_kb=0
-integer selected_count=0
-typeset category state size target_path allowed_root identity action eligibility
-: > "$selected_plan"
-
-/usr/bin/printf '%-13s %-16s %10s  %s\n' "CATEGORY" "STATE" "SIZE" "PATH"
-/usr/bin/printf '%-13s %-16s %10s  %s\n' "-------------" "----------------" "----------" "----"
-while IFS="$tab" read -r category state size target_path allowed_root identity action; do
-  (( total_kb += size ))
-  eligibility="selected"
-  if [[ "$category" == "projects" && "$state" == "recent" && "$include_recent" -eq 0 ]]; then
-    eligibility="scan-only"
-  else
-    /usr/bin/printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$category" "$state" "$size" "$target_path" "$allowed_root" "$identity" "$action" >> "$selected_plan"
-    (( selected_kb += size ))
-    (( selected_count += 1 ))
+typeset scan_root retained_root temp_root metadata
+if [[ -n "$load_plan" ]]; then
+  python3 -B "$DEVCLEAN_LIB_DIR/plans.py" load "$load_plan" "$plan" "$temp_dir/settings" || exit 2
+  {
+    IFS="$tab" read -r DEVCLEAN_DELETE_MODE empty_trash restart_finder age_days max_depth
+    DEVCLEAN_SCAN_ROOTS=()
+    while IFS= read -r scan_root; do DEVCLEAN_SCAN_ROOTS+=("$scan_root"); done
+  } < "$temp_dir/settings"
+else
+  for scan_root in "${DEVCLEAN_SCAN_ROOTS[@]}"; do
+    devclean_validate_scan_root "$scan_root" || { devclean_die "unsafe or unavailable scan root: $scan_root"; exit 2; }
+  done
+  if (( select_projects )); then
+    for scan_root in "${DEVCLEAN_SCAN_ROOTS[@]}"; do
+      devclean_emit_artifacts_for_root "$scan_root" "$max_depth" "$age_days" "$raw_plan"
+      if [[ "$scan_root" == "${HOME:A}" ]]; then
+        for retained_root in "$HOME/.local/share" "$HOME/.openclaw/tmp" "$HOME/.codex/"{artifacts,task-artifacts,task-backups,backups,worktree-backups,tmp}; do
+          [[ -d "$retained_root" && ! -L "$retained_root" ]] || continue
+          devclean_emit_artifacts_for_root "$retained_root" 12 "$age_days" "$raw_plan"
+        done
+      fi
+    done
   fi
-  [[ "$eligibility" == "scan-only" ]] && state="$state (skip)"
-  /usr/bin/printf '%-13s %-16s %10s  %s\n' "$category" "$state" "$(devclean_format_kb "$size")" "$target_path"
-done < "$plan"
-
-devclean_info ""
-devclean_info "Found $(devclean_format_kb "$total_kb") across $(/usr/bin/wc -l < "$plan" | /usr/bin/tr -d ' ') artifacts."
-if [[ "$command_mode" == "scan" ]]; then
-  devclean_info "Read-only scan complete. Run 'clear-dev-caches clean' with the same options to apply."
-  exit 0
+  for temp_root in "${DEVCLEAN_TEMP_ROOTS[@]}"; do
+    python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" temp-root "$temp_root" || { devclean_die "unsafe or unavailable temporary root: $temp_root"; exit 2; }
+    (( select_temp_projects )) && devclean_emit_artifacts_for_root "$temp_root" "$max_depth" "$age_days" "$raw_plan"
+    (( select_temp )) && devclean_plan_temp "$raw_plan" "$age_days" "$temp_root"
+  done
+  (( select_shared )) && devclean_plan_shared_caches "$raw_plan"
+  (( select_shorebird )) && devclean_plan_shorebird "$raw_plan"
+  (( select_xcode )) && devclean_plan_xcode "$raw_plan"
+  (( select_android )) && devclean_plan_android "$raw_plan"
+  (( select_colima )) && devclean_plan_colima "$raw_plan" "$inspect_stopped_colima" "${DEVCLEAN_COLIMA_PROFILES[@]}"
+  (( select_android_avd )) && devclean_plan_android_avd_data "$raw_plan" "${DEVCLEAN_AVDS[@]}"
+  devclean_deduplicate_plan "$raw_plan" "$plan" || exit 1
+  LC_ALL=C /usr/bin/sort -t "$tab" -k1,1 -k4,4 "$plan" -o "$plan" || exit 1
 fi
+typeset -g DEVCLEAN_MAX_DEPTH="$max_depth"
 
-if (( selected_count == 0 )); then
-  devclean_info "Nothing is eligible for cleanup. Use --include-recent only after reviewing recent projects."
-  exit 0
-fi
+: > "$selected_plan"
+/usr/bin/awk -F '\t' -v recent="$include_recent" -v loaded="$([[ -n "$load_plan" ]] && print 1 || print 0)" -v selected="$selected_plan" -v totals="$temp_dir/totals" '
+  function size(kb) {
+    if (kb >= 1048576) return sprintf("%.2f GiB", kb / 1048576)
+    if (kb >= 1024) return sprintf("%.1f MiB", kb / 1024)
+    return sprintf("%d KiB", kb)
+  }
+  BEGIN { printf "%-13s %-16s %10s  %s\n", "CATEGORY", "STATE", "ESTIMATE", "PATH" }
+  {
+    state = $2
+    # Saved plans already contain only the selected rows. Never expand them.
+    if ($7 == "skip" || state == "unmeasured" || ($1 == "projects" && state == "recent" && !recent && !loaded)) {
+      state = state " (skip)"
+    } else {
+      print $0 >> selected
+      count++
+      if ($1 == "colima") docker_kb += $3; else path_kb += $3
+    }
+    printf "%-13s %-16s %10s  %s\n", $1, state, size($3), $4
+  }
+  END { printf "%d\t%.0f\t%.0f\n", count, path_kb, docker_kb > totals }
+' "$plan" || exit 1
+integer selected_count selected_kb docker_kb
+IFS="$tab" read -r selected_count selected_kb docker_kb < "$temp_dir/totals"
 
 typeset mode_note="move to Trash"
 [[ "$DEVCLEAN_DELETE_MODE" == "permanent" ]] && mode_note="permanently remove"
-devclean_info "Selected $selected_count actions, up to $(devclean_format_kb "$selected_kb") ($mode_note for path artifacts)."
-(( select_colima )) && devclean_warn "Colima cleanup preserves volumes but removes stopped containers, unused images, networks, and build cache"
-(( select_android_avd )) && devclean_warn "Android AVD cleanup resets emulator user data and snapshots"
-(( select_temp )) && devclean_warn "temporary-file cleanup permanently targets old entries in the exact current-user TMPDIR"
+devclean_info "Selected $selected_count actions: $(devclean_format_kb "$selected_kb") of filesystem targets ($mode_note for path artifacts)."
+if /usr/bin/grep -q '^colima' "$selected_plan"; then
+  devclean_info "Docker estimate: $(devclean_format_kb "$docker_kb") inside the selected VMs. Mac disk recovery is measured after trim."
+  devclean_warn "Colima preserves volumes and active containers; stopped profiles in the plan start temporarily without changing the Docker context"
+fi
+/usr/bin/grep -q '^android-avd' "$selected_plan" && devclean_warn "AVD cleanup resets the selected inactive emulator's apps, user data and snapshots"
+/usr/bin/grep -q '^temp' "$selected_plan" && devclean_warn "temporary cleanup targets whole old entries, including any test copies and results inside them"
 [[ "$DEVCLEAN_DELETE_MODE" == "permanent" ]] && devclean_warn "permanent mode cannot be undone"
 (( empty_trash )) && devclean_warn "the approved plan also empties all items currently in Trash"
+(( restart_finder )) && devclean_warn "Finder may restart if emptying Trash fails"
+
+if [[ "$command_mode" == "scan" ]]; then
+  if [[ -n "$save_plan" ]]; then
+    python3 -B "$DEVCLEAN_LIB_DIR/plans.py" save "$selected_plan" "$save_plan" "$DEVCLEAN_DELETE_MODE" \
+      "$empty_trash" "$restart_finder" "$age_days" "$max_depth" "${DEVCLEAN_SCAN_ROOTS[@]}" || exit 2
+    devclean_info "Saved exact cleanup plan: $save_plan"
+  fi
+  devclean_info "Read-only scan complete. Review the plan before running clean."
+  exit 0
+fi
+if (( selected_count == 0 )); then
+  devclean_info "Nothing is eligible for cleanup."
+  exit 0
+fi
 devclean_confirm "Apply exactly this cleanup plan?" || { devclean_info "Cancelled."; exit 1; }
 
 DEVCLEAN_DRY_RUN=0
-integer before_free after_free successes=0 failures=0
+integer before_free after_free successes=0 skipped=0 failures=0 result last_open_check=0
 before_free="$(devclean_disk_free_kb)"
-while IFS="$tab" read -r category state size target_path allowed_root identity action; do
+# Re-evaluate SDK references without adding any newly eligible packages.
+if /usr/bin/grep -q '^android-sdk' "$selected_plan"; then
+  : > "$temp_dir/current-android"
+  devclean_plan_android "$temp_dir/current-android"
+fi
+typeset category state size target_path allowed_root identity action
+while IFS="$tab" read -r category state size target_path allowed_root identity action metadata; do
+  if [[ "$action" == "path" || "$action" == "wipe-avd" ]] && (( EPOCHSECONDS - last_open_check >= 2 )); then
+    if ! devclean_refresh_open_paths "$temp_dir/open-paths"; then
+      devclean_warn "cannot verify open files; skipped: $target_path"
+      (( skipped += 1 ))
+      continue
+    fi
+    last_open_check=$EPOCHSECONDS
+  fi
   if [[ "$action" == "path" ]]; then
-    devclean_delete_target "$category" "$target_path" "$allowed_root" "$identity"
+    if [[ "$category" == "projects" ]] && ! python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" project-check "$target_path" "$allowed_root" "$age_days" "$state"; then
+      devclean_warn "project marker changed; skipped: $target_path"
+      result=2
+    elif [[ "$category" == "temp" ]] && ! python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" temp-check "$target_path" "$allowed_root" "$age_days"; then
+      devclean_warn "temporary entry changed or is protected; skipped: $target_path"
+      result=2
+    elif [[ "$category" == "shorebird" ]]; then
+      typeset revision="$(devclean_shorebird_current_revision || true)"
+      if [[ -n "$revision" && "${target_path:t}" != "$revision" ]]; then
+        devclean_delete_target "$category" "$target_path" "$allowed_root" "$identity"; result=$?
+      else
+        devclean_warn "active or unknown Shorebird revision; skipped: $target_path"
+        result=2
+      fi
+    else
+      devclean_delete_target "$category" "$target_path" "$allowed_root" "$identity"; result=$?
+    fi
   elif [[ "$action" == sdkmanager:* ]]; then
-    devclean_apply_android_package "$target_path" "$allowed_root" "$identity" "${action#sdkmanager:}"
+    if /usr/bin/awk -F '\t' -v target="$target_path" -v action="$action" '$4 == target && $7 == action { found=1 } END { exit !found }' "$temp_dir/current-android"; then
+      devclean_apply_android_package "$target_path" "$allowed_root" "$identity" "${action#sdkmanager:}"; result=$?
+    else
+      devclean_warn "Android package is now referenced or unavailable; skipped: $target_path"
+      result=2
+    fi
   elif [[ "$action" == "wipe-avd" ]]; then
-    devclean_wipe_avd "$target_path" "$allowed_root" "$identity"
-  elif [[ "$action" == "colima-prune" ]]; then
-    devclean_apply_colima "$target_path" "$identity"
+    devclean_wipe_avd "$target_path" "$allowed_root" "$identity" "$metadata"; result=$?
+  elif [[ "$action" == colima-prune:* ]]; then
+    devclean_apply_colima "$target_path" "$allowed_root" "$identity" "${action#colima-prune:}" "$metadata"; result=$?
   else
     devclean_warn "unknown planned action; skipped: $action"
-    false
+    result=2
   fi
-  if (( $? == 0 )); then
-    (( successes += 1 ))
-  else
-    (( failures += 1 ))
-  fi
+  case "$result" in
+    0) (( successes += 1 )) ;;
+    2) (( skipped += 1 )) ;;
+    *) (( failures += 1 )) ;;
+  esac
 done < "$selected_plan"
 
 if (( empty_trash && successes > 0 )); then
   if devclean_empty_trash "$restart_finder"; then
     devclean_info "Trash emptied."
+    DEVCLEAN_TRASHED=0
   else
     (( failures += 1 ))
   fi
 fi
 
 after_free="$(devclean_disk_free_kb)"
-devclean_info "Completed: $successes succeeded, $failures skipped or failed."
+devclean_info "Completed: $successes succeeded, $skipped skipped, $failures failed."
 if [[ "$before_free" == <-> && "$after_free" == <-> ]]; then
   devclean_info "Data volume free: $(devclean_format_kb "$before_free") -> $(devclean_format_kb "$after_free")."
 fi
-if [[ "$DEVCLEAN_DELETE_MODE" == "trash" && "$empty_trash" -eq 0 ]]; then
+if (( DEVCLEAN_TRASHED )); then
   devclean_info "Items moved to Trash do not release disk space until Trash is emptied."
 fi
-(( failures == 0 ))
+(( failures == 0 && skipped == 0 ))

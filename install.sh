@@ -42,6 +42,11 @@ install_link() {
   print -r -- "Installed: $target_path -> $source_path"
 }
 
+if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys; sys.exit(sys.version_info < (3, 9))'; then
+  print -u2 -r -- "error: Python 3.9 or newer is required"
+  exit 1
+fi
+
 install_link "$repo_dir/bin/clear-dev-caches" "$HOME/.local/bin/clear-dev-caches" || exit 1
 
 if (( install_skills )); then

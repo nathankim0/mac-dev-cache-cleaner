@@ -13,7 +13,9 @@ devclean_plan_path() {
   [[ -e "$target_path" && ! -L "$target_path" ]] || return 0
   devclean_path_is_recordable "$target_path" || return 0
   local size identity
-  size="$(devclean_size_kb "$target_path")"
+  if ! size="$(devclean_size_kb "$target_path")" || [[ "$size" != <-> ]]; then
+    size=0; state=unmeasured; action=skip
+  fi
   identity="$(devclean_identity "$target_path")"
   [[ -n "$identity" ]] || return 0
   /usr/bin/printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
@@ -21,21 +23,10 @@ devclean_plan_path() {
 }
 
 devclean_plan_shared_caches() {
-  local output_file="$1"
-  local cache_path
-  for cache_path in \
-    "$HOME/.gradle/caches" \
-    "$HOME/.gradle/.tmp" \
-    "$HOME/.npm/_cacache" \
-    "$HOME/.yarn/cache" \
-    "$HOME/.pnpm-store" \
-    "$HOME/.bun/install/cache" \
-    "$HOME/Library/Caches/CocoaPods" \
-    "$HOME/Library/Caches/ms-playwright" \
-    "$HOME/Library/Caches/node-gyp" \
-    "$HOME/Library/Caches/Homebrew"; do
-    devclean_plan_path "$output_file" "shared" "rebuildable" "$cache_path" "$HOME"
-  done
+  local output_file="$1" cache_path
+  while IFS= read -r cache_path; do
+    devclean_plan_path "$output_file" "shared" "rebuildable" "$cache_path" "${HOME:A}"
+  done < <(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" shared-paths)
 }
 
 devclean_shorebird_current_revision() {
@@ -185,60 +176,81 @@ devclean_plan_android() {
 
 devclean_plan_android_avd_data() {
   local output_file="$1"
-  local avd_root="$HOME/.android/avd"
-  local avd_dir
+  shift
+  local avd_root="${HOME:A}/.android/avd" avd_dir name info size fingerprint state action sdk_root adb_bin
+  sdk_root="$(devclean_android_sdk_root || true)"
+  adb_bin="$(devclean_android_tool adb "$sdk_root")"
   for avd_dir in "$avd_root"/*.avd(N/); do
-    devclean_plan_path "$output_file" "android-avd" "device-data" "$avd_dir" "$avd_root" "wipe-avd"
+    name="${${avd_dir:t}%.avd}"
+    (( $# == 0 )) || (( ${argv[(Ie)$name]} )) || continue
+    [[ ! -L "$avd_dir" ]] && devclean_path_is_recordable "$avd_dir" || continue
+    info="$(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" avd-state "$avd_dir")" || continue
+    IFS=$'\t' read -r size fingerprint <<< "$info"
+    state="inactive device data"; action=wipe-avd
+    if ! devclean_avd_inactive "$name" "$adb_bin"; then
+      state="active or unknown"; action=skip
+    elif (( size == 0 )); then
+      state="no allocated user data"; action=skip
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' android-avd "$state" "$size" "$avd_dir" "$avd_root" \
+      "$(devclean_identity "$avd_dir")" "$action" "$fingerprint" >> "$output_file"
   done
 }
 
 devclean_plan_colima() {
-  local output_file="$1"
-  local colima_root="$HOME/.colima"
-  devclean_command_exists colima || return 0
-  devclean_plan_path "$output_file" "colima" "preserve-volumes" "$colima_root" "$HOME" "colima-prune"
+  local output_file="$1" inspect_stopped="$2"
+  shift 2
+  [[ -d "$HOME/.colima" && ! -L "$HOME/.colima" ]] && devclean_command_exists colima || return 0
+  python3 -B "$DEVCLEAN_LIB_DIR/colima.py" plan "$inspect_stopped" "$@" >> "$output_file"
 }
 
 devclean_plan_temp() {
-  local output_file="$1"
-  local age_days="$2"
-  local temp_root="${TMPDIR:-}"
-  [[ -n "$temp_root" && -d "$temp_root" && ! -L "$temp_root" ]] || return 0
-  temp_root="${temp_root:A}"
-  [[ "$temp_root" == /private/var/folders/*/T(|/) ]] || {
-    devclean_warn "refusing unexpected TMPDIR: $temp_root"
-    return 0
+  local output_file="$1" age_days="$2" temp_root="$3"
+  python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" temp-root "$temp_root" || {
+    devclean_warn "refusing unexpected temporary root: $temp_root"
+    return 1
   }
-  local candidate
-  while IFS= read -r candidate; do
-    [[ -e "$candidate" && ! -L "$candidate" ]] || continue
-    devclean_plan_path "$output_file" "temp" "older-than-${age_days}d" "$candidate" "$temp_root"
-  done < <(/usr/bin/find "$temp_root" -mindepth 1 -maxdepth 1 -mtime "+$age_days" -user "$(/usr/bin/id -un)" -print 2>/dev/null)
+  python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" temp "$temp_root" "$age_days" >> "$output_file"
+}
+
+devclean_avd_inactive() {
+  local avd_name="$1" adb_bin="$2" devices serial state running_name
+  [[ -n "$adb_bin" ]] || return 1
+  devices="$("$adb_bin" devices 2>/dev/null)" || return 1
+  while IFS=$' \t' read -r serial state; do
+    [[ "$serial" == emulator-* ]] || continue
+    [[ "$state" == device ]] || return 1
+    running_name="$("$adb_bin" -s "$serial" shell getprop ro.boot.qemu.avd_name 2>/dev/null)" || return 1
+    [[ -n "$running_name" && "$running_name" != "$avd_name" ]] || return 1
+  done <<< "$devices"
 }
 
 devclean_wipe_avd() {
   local avd_dir="$1"
   local avd_root="$2"
-  local expected_identity="$3"
-  devclean_validate_delete_target "$avd_dir" "$avd_root" || return 1
-  [[ "$(devclean_identity "$avd_dir")" == "$expected_identity" ]] || return 1
+  local expected_identity="$3" expected_state="$4"
+  devclean_validate_delete_target "$avd_dir" "$avd_root" || return 2
+  [[ "$avd_root" == "${HOME:A}/.android/avd" && "${avd_dir:h}" == "$avd_root" && "$avd_dir" == *.avd ]] || return 2
+  [[ "$(devclean_identity "$avd_dir")" == "$expected_identity" ]] || return 2
   local sdk_root adb_bin
   sdk_root="$(devclean_android_sdk_root || true)"
   adb_bin="$(devclean_android_tool adb "$sdk_root")"
-  if [[ -n "$adb_bin" ]] && "$adb_bin" devices 2>/dev/null | /usr/bin/tail -n +2 | /usr/bin/grep -q '^emulator-'; then
-    devclean_warn "an Android device/emulator is active; skipped AVD wipe: ${avd_dir:t}"
-    return 1
+  if ! devclean_avd_inactive "${${avd_dir:t}%.avd}" "$adb_bin" || devclean_target_is_open "$avd_dir"; then
+    devclean_warn "AVD is active or its status is unknown; skipped: ${avd_dir:t}"
+    return 2
+  fi
+  local info state_path
+  info="$(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" avd-state "$avd_dir")" || return 2
+  if [[ "${info#*$'\t'}" != "$expected_state" ]]; then
+    devclean_warn "AVD data changed since review; skipped: ${avd_dir:t}"
+    return 2
   fi
   (( DEVCLEAN_DRY_RUN )) && return 0
-  local state_path
-  for state_path in \
-    "$avd_dir/userdata-qemu.img.qcow2" "$avd_dir/snapshots" "$avd_dir/sdcard.img" \
-    "$avd_dir/encryptionkey.img.qcow2" "$avd_dir/cache.img.qcow2" "$avd_dir/cache.img" \
-    "$avd_dir/bootcompleted.ini" "$avd_dir/read-snapshot.txt"; do
-    [[ -e "$state_path" ]] || continue
-    # SAFE: every state file is an exact child of a revalidated *.avd directory; config.ini and base images are excluded.
+  while IFS= read -r state_path; do
+    [[ -e "$state_path" && ! -L "$state_path" ]] || continue
+    # SAFE: each state file is an exact child of the revalidated AVD directory.
     /usr/bin/find "$state_path" -depth -delete || return 1
-  done
+  done < <(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" avd-paths "$avd_dir")
   devclean_log_operation "WIPED" "android-avd" "$avd_dir" "user-data"
 }
 
@@ -250,11 +262,11 @@ devclean_apply_android_package() {
   devclean_validate_delete_target "$target_path" "$sdk_root" || return 1
   [[ "$(devclean_identity "$target_path")" == "$expected_identity" ]] || return 1
   (( DEVCLEAN_DRY_RUN )) && return 0
-  local adb_bin
+  local adb_bin devices
   adb_bin="$(devclean_android_tool adb "$sdk_root")"
-  if [[ -n "$adb_bin" ]] && "$adb_bin" devices 2>/dev/null | /usr/bin/tail -n +2 | /usr/bin/grep -q '^emulator-'; then
-    devclean_warn "an Android emulator is active; skipped SDK package: $package_id"
-    return 1
+  if [[ -z "$adb_bin" ]] || ! devices="$("$adb_bin" devices 2>/dev/null)" || /usr/bin/grep -q '^emulator-' <<< "$devices"; then
+    devclean_warn "an Android emulator is active or its status is unknown; skipped SDK package: $package_id"
+    return 2
   fi
   if [[ "${DEVCLEAN_TEST_MODE:-0}" == "1" ]]; then
     devclean_delete_target "android-sdk" "$target_path" "$sdk_root" "$expected_identity"
@@ -263,25 +275,15 @@ devclean_apply_android_package() {
   local sdkmanager_bin
   sdkmanager_bin="$(devclean_android_tool sdkmanager "$sdk_root")"
   [[ -n "$sdkmanager_bin" ]] || { devclean_warn "sdkmanager not found; skipped $package_id"; return 1; }
-  "$sdkmanager_bin" --uninstall "$package_id"
+  "$sdkmanager_bin" "--sdk_root=$sdk_root" --uninstall "$package_id"
 }
 
 devclean_apply_colima() {
-  local colima_root="$1"
-  local expected_identity="$2"
-  devclean_validate_delete_target "$colima_root" "$HOME" || return 1
-  [[ "$(devclean_identity "$colima_root")" == "$expected_identity" ]] || return 1
+  local profile_path="$1" root="$2" expected_identity="$3" profile="$4" metadata="$5"
+  [[ "$root" == "${HOME:A}/.colima" && "$profile_path" == "$root/$profile" ]] || return 2
+  devclean_validate_delete_target "$profile_path" "$root" || return 2
+  [[ "$(devclean_identity "$profile_path")" == "$expected_identity" ]] || return 2
   (( DEVCLEAN_DRY_RUN )) && return 0
-  devclean_command_exists colima && devclean_command_exists docker || return 1
-
-  local was_running=0
-  colima status >/dev/null 2>&1 && was_running=1
-  if (( ! was_running )); then
-    colima stop --force >/dev/null 2>&1 || true
-    colima start || return 1
-  fi
-  docker system prune --all --force || return 1
-  colima ssh -- sudo fstrim -av >/dev/null 2>&1 || devclean_warn "Colima trim failed; Docker data was still pruned"
-  (( was_running )) || colima stop
-  devclean_log_operation "PRUNED" "colima" "$colima_root" "volumes-preserved"
+  python3 -B "$DEVCLEAN_LIB_DIR/colima.py" prune "$profile" "$metadata" || return $?
+  devclean_log_operation "PRUNED" "colima" "$profile_path" "volumes-preserved"
 }
