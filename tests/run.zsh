@@ -301,6 +301,20 @@ if (( EUID != 0 )); then
   assert_contains "unreadable Trash is not reported empty" "$output" "Trash is unmeasured"
 fi
 
+# Xcode plans isolate direct cache children and preserve an active sibling.
+typeset derived="$fixture_home/Library/Developer/Xcode/DerivedData"
+/bin/mkdir -p "$derived/Inactive-app/Build" "$derived/Active-app/Build"
+print -r -- 'cache' > "$derived/Inactive-app/Build/data"
+print -r -- 'in use' > "$derived/Active-app/Build/data"
+output="$(HOME="$fixture_home" "$cli" scan --xcode --permanent --save-plan "$fixture_root/xcode-plan.json" 2>&1)"
+assert_contains "Xcode scan names individual caches" "$output" "$derived/Inactive-app"
+exec {xcode_fd}< "$derived/Active-app/Build/data"
+output="$(HOME="$fixture_home" "$cli" clean --plan "$fixture_root/xcode-plan.json" --user-approved 2>&1 || true)"
+exec {xcode_fd}<&-
+assert_missing "inactive Xcode cache is removed" "$derived/Inactive-app"
+assert_exists "active sibling Xcode cache survives" "$derived/Active-app/Build/data"
+assert_exists "DerivedData container survives" "$derived"
+
 python3 -B -m unittest discover -s "$repo_dir/tests" -p 'test_*.py' || fail "Colima fixture tests"
 
 print -r -- ""

@@ -57,8 +57,11 @@ devclean_plan_shorebird() {
 
 devclean_plan_xcode() {
   local output_file="$1"
-  devclean_plan_path "$output_file" "xcode" "rebuildable" \
-    "$HOME/Library/Developer/Xcode/DerivedData" "$HOME/Library/Developer/Xcode"
+  local cache_root="$HOME/Library/Developer/Xcode/DerivedData" cache_dir
+  # Keep a running app's cache without retaining every unrelated project's output.
+  for cache_dir in "$cache_root"/*(N/); do
+    devclean_plan_path "$output_file" "xcode" "rebuildable" "$cache_dir" "$cache_root"
+  done
 }
 
 devclean_android_sdk_root() {

@@ -29,7 +29,9 @@ def row_is_valid(row):
         if category == 'shared':
             return root == h and path in {h / item for item in SHARED_PATHS}
         if category == 'xcode':
-            return path == h / 'Library/Developer/Xcode/DerivedData' and root == path.parent
+            derived = h / 'Library/Developer/Xcode/DerivedData'
+            return ((path == derived and root == derived.parent)
+                    or (root == derived and path.parent == derived))
         if category == 'shorebird':
             return path.parent == root == h / '.shorebird/bin/cache/flutter'
         if category == 'temp':
