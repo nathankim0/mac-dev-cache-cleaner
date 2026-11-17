@@ -9,6 +9,7 @@ It discovers projects from markers such as `.git`, `package.json`, `pubspec.yaml
 - Read-only `scan` is the default; cleanup requires the explicit `clean` command and confirmation.
 - Recently active projects are visible but excluded unless `--include-recent` is passed.
 - Paths are revalidated immediately before removal, including filesystem identity checks.
+- Git-tracked files are preserved even inside folders named `build`, `dist`, or `.dart_tool`, including when replaying saved plans.
 - Trash is the default for path-based artifacts; `--permanent` is explicit.
 - Shorebird keeps the active Flutter revision.
 - Android keeps the newest API, images referenced by AVDs, and NDKs referenced by Flutter or discovered Gradle projects.

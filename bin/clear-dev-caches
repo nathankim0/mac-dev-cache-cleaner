@@ -214,7 +214,9 @@ cleanup_temp_dir() {
   # SAFE: temp_dir was created by mktemp in this process and its basename is revalidated.
   /usr/bin/find "$temp_dir" -depth -delete 2>/dev/null || true
 }
-trap cleanup_temp_dir EXIT INT TERM
+trap cleanup_temp_dir EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 typeset tab=$'\t'
 typeset scan_root retained_root temp_root metadata

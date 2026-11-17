@@ -183,6 +183,23 @@ def mixed_output(path):
     return False
 
 
+def tracked_source(path):
+    """Cache-like names can contain source; protect tracked files even under nested markers."""
+    try:
+        for parent in path.parents:
+            marker = parent / '.git'
+            if not marker.exists():
+                continue
+            result = subprocess.run(
+                ['git', '-C', str(parent), 'ls-files', '-z', '--', str(path.relative_to(parent))],
+                capture_output=True, timeout=10,
+            )
+            return result.returncode != 0 or bool(result.stdout)
+    except (OSError, subprocess.TimeoutExpired):
+        return True
+    return False
+
+
 def projects(root, depth, age):
     cutoff = time.time() - age * 86400
     stack = [(root, 0, None)]
@@ -206,7 +223,9 @@ def projects(root, depth, age):
             if entry.name in ARTIFACTS:
                 if project:
                     info = real_owned(path)
-                    if info and mixed_output(path):
+                    if info and tracked_source(path):
+                        print(f'warning: tracked source preserved: {path}', file=sys.stderr)
+                    elif info and mixed_output(path):
                         print(f'warning: mixed build output preserved: {path}', file=sys.stderr)
                     elif info:
                         if project not in recency:
@@ -316,7 +335,8 @@ def main():
     elif command == 'project-check':
         path, root = map(pathlib.Path, args[:2])
         project = find_project(path, root)
-        if not (path.is_dir() and path.name in ARTIFACTS and project and not mixed_output(path)):
+        if not (path.is_dir() and path.name in ARTIFACTS and project
+                and not tracked_source(path) and not mixed_output(path)):
             return 1
         return 1 if args[3] == 'old' and recent_project(project, time.time() - int(args[2]) * 86400) else 0
     elif command == 'avd-state':
