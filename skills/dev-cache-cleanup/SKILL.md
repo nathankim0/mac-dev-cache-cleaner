@@ -52,3 +52,13 @@ Use `clear-dev-caches` to discover rebuildable artifacts without hardcoding proj
 After a successful deployment, scan the deployed repository with `clear-dev-caches scan --root <repository> --projects`. Clean only disposable build outputs approved by the user or the deployment workflow. Then scan `--shorebird` when Shorebird was used.
 
 Do not clean after a failed or interrupted deployment. Preserve build outputs, logs, symbols, release artifacts, and patch state needed for diagnosis or retry.
+
+## Native builds, simulator reuse and explicit data reset
+
+- When large usage remains, include `scan --temp-projects` and `scan --ios-simulator-data` alongside project/Colima checks. Owned Claude temporary roots and Hermes scratch roots are included in temporary-project discovery; do not infer that their whole session folders are disposable.
+- Gradle intermediates, generated resources, `.cxx` and recognized custom DerivedData build children are cache candidates. `build/outputs` stays `release-review (skip)` unless `--release-artifacts` is explicitly selected for completed releases. Inspect source/keys and keep current implementations protected.
+- `scan --ios-simulator-data` measures only. `--simulator <UUID>` selects exact shutdown devices; obtain approval for loss of their apps, logins and test data before applying the saved plan. Definitions/runtimes remain, and booted or changed devices are skipped. Prefer reusing existing idle iPhone/Android devices rather than creating one per app.
+- Active source files and working directories protect their project caches during scan and cleanup. Idle or unidentified sessions still need manual exclusion. Do not prune the shared VM/build caches of ongoing implementations just to reach a requested size estimate.
+- An inspected empty Colima image inventory does not imply its host disk is free. Offer trim, preserve volumes, inspect remaining volume purposes and report actual host allocation/free space. Do not call the VM's whole size reclaimable or delete it to force the estimate.
+
+- Tool development tests must use an isolated HOME and fixture-only mutation boundary. Never auto-discover the real user's system scratch roots when HOME is overridden. Validate this boundary before full cleanup regressions; source protection alone does not authorize deleting an unapproved cache.

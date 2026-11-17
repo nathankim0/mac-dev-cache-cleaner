@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import time
+import extra_artifacts
 
 ARTIFACTS = frozenset('node_modules build .dart_tool .next dist target .turbo .pytest_cache .parcel-cache Pods'.split())
 BROAD_OUTPUTS = frozenset(('build', 'dist', 'target'))
@@ -56,6 +57,8 @@ def real_owned(path):
 
 def allowed_temp_root(root):
     current = pathlib.Path(os.environ.get('TMPDIR', '/tmp')).resolve()
+    if root in set(extra_artifacts.scratch_roots(home())):
+        return True
     return root.name in ('T', 'tmp') and bool(real_owned(root)) and root.is_dir() and (
         (root == current and str(root).startswith('/private/var/folders/'))
         or (root != home() and within(root, home()) and not protected(root))
@@ -200,10 +203,11 @@ def tracked_source(path):
     return False
 
 
-def projects(root, depth, age):
+def projects(root, depth, age, release_artifacts=False):
     cutoff = time.time() - age * 86400
     stack = [(root, 0, None)]
     candidates, recency = [], {}
+    native = {'native-cache': [], 'release-output': []}
     unavailable = 0
     while stack:
         directory, level, project = stack.pop()
@@ -219,6 +223,21 @@ def projects(root, depth, age):
         for entry in entries:
             path = pathlib.Path(entry.path)
             if not entry.is_dir(follow_symlinks=False) or protected(path) or not recordable(path):
+                continue
+            category = extra_artifacts.kind(path)
+            if category:
+                info = real_owned(path)
+                if info and not tracked_source(path) and not extra_artifacts.private_material(path):
+                    owner = project or extra_artifacts.context(path)
+                    if owner not in recency:
+                        recency[owner] = recent_project(owner, cutoff)
+                    state = 'recent' if info.st_mtime >= cutoff or recency[owner] else 'old'
+                    if category == 'release-output' and not release_artifacts:
+                        state = 'release-review'
+                    native[category].append((path, info, state))
+                continue
+            if extra_artifacts.container(path):
+                stack.append((path, level + 1, project))
                 continue
             if entry.name in ARTIFACTS:
                 if project:
@@ -239,6 +258,8 @@ def projects(root, depth, age):
     if unavailable:
         print(f'warning: {unavailable} unreadable directories were not scanned under {root}', file=sys.stderr)
     emit('projects', root, candidates)
+    for category, rows in native.items():
+        emit(category, root, rows)
 
 
 def sensitive_name(name):
@@ -289,14 +310,32 @@ def open_paths():
     if result.returncode not in (0, 1) or (result.returncode and result.stderr):
         raise RuntimeError('could not inspect open files')
     paths = set()
+    projects_in_use = set()
+    checked = {}
     for record in result.stdout.split(b'\0'):
         record = record.lstrip(b'\n')
         if record.startswith(b'n/'):
             path = pathlib.Path(os.fsdecode(record[1:]).removesuffix(' (deleted)'))
             paths.add(path)
             paths.update(path.parents)
+            # Protect all caches of an active source project, not just open cache files.
+            parent = path if path.is_dir() else path.parent
+            if parent not in checked:
+                fallback = None
+                owner = None
+                for ancestor in (parent, *parent.parents):
+                    if (ancestor / '.git').exists():
+                        owner = ancestor
+                        break
+                    if any((ancestor / marker).is_file() for marker in ('package.json', 'pubspec.yaml', 'settings.gradle', 'settings.gradle.kts')):
+                        fallback = ancestor
+                checked[parent] = owner or fallback
+            if checked[parent]:
+                projects_in_use.add(checked[parent])
     for path in paths:
         sys.stdout.buffer.write(os.fsencode(path) + b'\0')
+    for path in projects_in_use:
+        sys.stdout.buffer.write(b'@project:' + os.fsencode(path) + b'\0')
 
 
 def avd_state(root):
@@ -322,13 +361,30 @@ def avd_state(root):
 def main():
     command, *args = sys.argv[1:]
     if command == 'projects':
-        projects(pathlib.Path(args[0]), int(args[1]), int(args[2]))
+        projects(pathlib.Path(args[0]), int(args[1]), int(args[2]), len(args) > 3 and args[3] == '1')
     elif command == 'temp':
         temporary(pathlib.Path(args[0]), int(args[1]))
     elif command == 'open-paths':
         open_paths()
     elif command == 'temp-root':
         return 0 if allowed_temp_root(pathlib.Path(args[0])) else 1
+    elif command == 'private-project-root':
+        return 0 if extra_artifacts.private_project_root(pathlib.Path(args[0])) else 1
+    elif command == 'scratch-roots':
+        for path in extra_artifacts.scratch_roots(home()):
+            print(path)
+    elif command == 'artifact-context':
+        path = pathlib.Path(args[0])
+        if extra_artifacts.kind(path):
+            print(extra_artifacts.context(path))
+    elif command == 'native-check':
+        path, root = map(pathlib.Path, args[:2])
+        if (not path.is_dir() or not within(path, root) or protected(path)
+                or extra_artifacts.kind(path) != args[4] or tracked_source(path)
+                or extra_artifacts.private_material(path)):
+            return 1
+        owner = find_project(path, root) or extra_artifacts.context(path)
+        return 1 if args[3] == 'old' and recent_project(owner, time.time() - int(args[2]) * 86400) else 0
     elif command == 'temp-check':
         root = pathlib.Path(args[1])
         return 0 if allowed_temp_root(root) and temp_candidate(pathlib.Path(args[0]), root, time.time() - int(args[2]) * 86400) else 1

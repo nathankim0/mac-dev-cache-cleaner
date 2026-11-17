@@ -23,13 +23,15 @@ unless the `clean` command is given and the plan is confirmed.
 
 Categories:
   --projects           Auto-discover rebuildable artifacts inside projects (default)
-  --temp-projects      Rebuildable project artifacts in the current user's TMPDIR
+  --temp-projects      Project/native caches in TMPDIR and owned agent scratch roots
+  --release-artifacts  Include Gradle release outputs; review completed releases first
   --shared             Shared package/build caches
   --shorebird          Inactive Shorebird Flutter revisions
   --xcode              Xcode DerivedData
   --android            Unused Android system images and NDKs
   --colima             Docker images/containers/build cache; preserves volumes
   --android-avd-data   Emulator user data and snapshots (explicit, aggressive)
+  --ios-simulator-data List iOS device data; only selected UUIDs become erase actions
   --temp               Old entries in an owned temporary root (explicit, aggressive)
   --all                All standard categories (excludes AVD data and temp)
 
@@ -39,6 +41,7 @@ Discovery and safety:
   --colima-profile NAME  Select a Docker profile; repeatable (default: all)
   --inspect-stopped-colima  Scan only: temporarily start/stop selected stopped VMs
   --avd NAME           Select one AVD for explicit user-data cleanup; repeatable
+  --simulator UUID     Select one shutdown iOS device for data erasure; repeatable
   --save-plan FILE     Save the exact eligible targets and deletion mode (scan)
   --plan FILE          Apply or display a saved plan without rediscovering targets
   --max-depth N        Maximum project discovery depth (default: 6)
@@ -76,6 +79,7 @@ integer select_xcode=0
 integer select_android=0
 integer select_colima=0
 integer select_android_avd=0
+integer select_ios=0
 integer select_temp=0
 integer category_was_selected=0
 integer include_recent=0
@@ -84,6 +88,8 @@ integer restart_finder=0
 integer max_depth=6
 integer age_days=7
 typeset -ga DEVCLEAN_SCAN_ROOTS=() DEVCLEAN_TEMP_ROOTS=() DEVCLEAN_COLIMA_PROFILES=() DEVCLEAN_AVDS=()
+typeset -ga DEVCLEAN_SIMULATORS=()
+integer -g DEVCLEAN_RELEASE_ARTIFACTS=0
 typeset save_plan="" load_plan=""
 integer inspect_stopped_colima=0 override_plan=0
 
@@ -91,12 +97,17 @@ while (( $# > 0 )); do
   case "$1" in
     --projects) select_projects=1; category_was_selected=1 ;;
     --temp-projects) select_temp_projects=1; category_was_selected=1 ;;
+    --release-artifacts) DEVCLEAN_RELEASE_ARTIFACTS=1; select_projects=1; category_was_selected=1 ;;
     --shared|--include-shared) select_shared=1; category_was_selected=1 ;;
     --shorebird) select_shorebird=1; category_was_selected=1 ;;
     --xcode) select_xcode=1; category_was_selected=1 ;;
     --android) select_android=1; category_was_selected=1 ;;
     --colima) select_colima=1; category_was_selected=1 ;;
     --android-avd-data) select_android_avd=1; category_was_selected=1 ;;
+    --ios-simulator-data) select_ios=1; category_was_selected=1 ;;
+    --simulator)
+      (( $# >= 2 )) || { devclean_die "--simulator requires a UUID"; exit 2; }
+      DEVCLEAN_SIMULATORS+=("$2"); select_ios=1; category_was_selected=1; shift ;;
     --temp) select_temp=1; category_was_selected=1 ;;
     --all)
       select_projects=1
@@ -200,6 +211,9 @@ fi
 (( ${#DEVCLEAN_SCAN_ROOTS[@]} )) || DEVCLEAN_SCAN_ROOTS=("${HOME:A}")
 if (( (select_temp || select_temp_projects) && !${#DEVCLEAN_TEMP_ROOTS[@]} )) && [[ -n "${TMPDIR:-}" ]]; then
   DEVCLEAN_TEMP_ROOTS=("${TMPDIR:A}")
+  if (( select_temp_projects )); then
+    while IFS= read -r temp_root; do DEVCLEAN_TEMP_ROOTS+=("$temp_root"); done < <(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" scratch-roots)
+  fi
 fi
 typeset -g DEVCLEAN_MAX_DEPTH="$max_depth"
 typeset temp_dir
@@ -253,7 +267,22 @@ else
   (( select_android )) && devclean_plan_android "$raw_plan"
   (( select_colima )) && devclean_plan_colima "$raw_plan" "$inspect_stopped_colima" "${DEVCLEAN_COLIMA_PROFILES[@]}"
   (( select_android_avd )) && devclean_plan_android_avd_data "$raw_plan" "${DEVCLEAN_AVDS[@]}"
+  if (( select_ios )); then
+    python3 -B "$DEVCLEAN_LIB_DIR/simulators.py" plan "${DEVCLEAN_SIMULATORS[@]}" >> "$raw_plan" || exit 1
+  fi
   devclean_deduplicate_plan "$raw_plan" "$plan" || exit 1
+  devclean_refresh_open_paths "$temp_dir/open-scan" || { devclean_die "cannot verify active projects"; exit 1; }
+  typeset scan_category scan_state scan_size scan_path scan_allowed scan_identity scan_action scan_metadata
+  : > "$temp_dir/activity-plan"
+  while IFS="$tab" read -r scan_category scan_state scan_size scan_path scan_allowed scan_identity scan_action scan_metadata; do
+    if [[ "$scan_action" == path || "$scan_action" == erase-ios ]] && devclean_target_is_open "$scan_path"; then
+      scan_state="in-use"; scan_action="skip"
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s' "$scan_category" "$scan_state" "$scan_size" "$scan_path" "$scan_allowed" "$scan_identity" "$scan_action" >> "$temp_dir/activity-plan"
+    [[ -n "$scan_metadata" ]] && printf '\t%s' "$scan_metadata" >> "$temp_dir/activity-plan"
+    printf '\n' >> "$temp_dir/activity-plan"
+  done < "$plan"
+  /bin/mv "$temp_dir/activity-plan" "$plan"
   LC_ALL=C /usr/bin/sort -t "$tab" -k1,1 -k4,4 "$plan" -o "$plan" || exit 1
 fi
 typeset -g DEVCLEAN_MAX_DEPTH="$max_depth"
@@ -269,7 +298,7 @@ typeset -g DEVCLEAN_MAX_DEPTH="$max_depth"
   {
     state = $2
     # Saved plans already contain only the selected rows. Never expand them.
-    if ($7 == "skip" || state == "unmeasured" || ($1 == "projects" && state == "recent" && !recent && !loaded)) {
+    if ($7 == "skip" || state == "unmeasured" || state == "release-review" || (state == "recent" && !recent && !loaded)) {
       state = state " (skip)"
     } else {
       print $0 >> selected
@@ -291,6 +320,7 @@ if /usr/bin/grep -q '^colima' "$selected_plan"; then
   devclean_warn "Colima preserves volumes and active containers; stopped profiles in the plan start temporarily without changing the Docker context"
 fi
 /usr/bin/grep -q '^android-avd' "$selected_plan" && devclean_warn "AVD cleanup resets the selected inactive emulator's apps, user data and snapshots"
+/usr/bin/grep -q '^ios-simulator' "$selected_plan" && devclean_warn "iOS erasure removes apps, logins and test data from selected shutdown devices; definitions and runtimes remain"
 /usr/bin/grep -q '^temp' "$selected_plan" && devclean_warn "temporary cleanup targets whole old entries, including any test copies and results inside them"
 [[ "$DEVCLEAN_DELETE_MODE" == "permanent" ]] && devclean_warn "permanent mode cannot be undone"
 (( empty_trash )) && devclean_warn "the approved plan also empties all items currently in Trash"
@@ -321,7 +351,7 @@ if /usr/bin/grep -q '^android-sdk' "$selected_plan"; then
 fi
 typeset category state size target_path allowed_root identity action
 while IFS="$tab" read -r category state size target_path allowed_root identity action metadata; do
-  if [[ "$action" == "path" || "$action" == "wipe-avd" ]] && (( EPOCHSECONDS - last_open_check >= 2 )); then
+  if [[ "$action" == "path" || "$action" == "wipe-avd" || "$action" == "erase-ios" ]] && (( EPOCHSECONDS - last_open_check >= 2 )); then
     if ! devclean_refresh_open_paths "$temp_dir/open-paths"; then
       devclean_warn "cannot verify open files; skipped: $target_path"
       (( skipped += 1 ))
@@ -332,6 +362,9 @@ while IFS="$tab" read -r category state size target_path allowed_root identity a
   if [[ "$action" == "path" ]]; then
     if [[ "$category" == "projects" ]] && ! python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" project-check "$target_path" "$allowed_root" "$age_days" "$state"; then
       devclean_warn "project marker changed; skipped: $target_path"
+      result=2
+    elif [[ "$category" == "native-cache" || "$category" == "release-output" ]] && ! python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" native-check "$target_path" "$allowed_root" "$age_days" "$state" "$category"; then
+      devclean_warn "native artifact changed or contains protected data; skipped: $target_path"
       result=2
     elif [[ "$category" == "temp" ]] && ! python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" temp-check "$target_path" "$allowed_root" "$age_days"; then
       devclean_warn "temporary entry changed or is protected; skipped: $target_path"
@@ -356,6 +389,14 @@ while IFS="$tab" read -r category state size target_path allowed_root identity a
     fi
   elif [[ "$action" == "wipe-avd" ]]; then
     devclean_wipe_avd "$target_path" "$allowed_root" "$identity" "$metadata"; result=$?
+  elif [[ "$action" == "erase-ios" ]]; then
+    if ! devclean_validate_delete_target "$target_path" "$allowed_root" || [[ "$(devclean_identity "$target_path")" != "$identity" ]] || devclean_target_is_open "$target_path"; then
+      devclean_warn "selected iOS simulator changed or is in use; skipped: $target_path"
+      result=2
+    else
+      python3 -B "$DEVCLEAN_LIB_DIR/simulators.py" erase "${target_path:t}" "$metadata"; result=$?
+      (( result == 0 )) && devclean_log_operation "ERASED" "$category" "$target_path" "simctl"
+    fi
   elif [[ "$action" == colima-prune:* ]]; then
     devclean_apply_colima "$target_path" "$allowed_root" "$identity" "${action#colima-prune:}" "$metadata"; result=$?
   else

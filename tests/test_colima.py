@@ -35,6 +35,18 @@ class ColimaSafety(unittest.TestCase):
         self.assertEqual(report['estimated_kib'], 8)
         self.assertEqual(report['volumes'], ['database'])
 
+    def test_empty_inspected_vm_still_offers_trim_without_claiming_recovery(self):
+        report = {**self.report, 'images': 0, 'stopped': 0, 'build_cache': 0, 'estimated_kib': 0}
+        with patch.object(colima, 'profiles', return_value=self.profile), \
+             patch.object(colima, 'profile_root', return_value=self.root), \
+             patch.object(colima, 'allocated_kib', return_value=17 * 1048576), \
+             patch.object(colima, 'daemon_socket', return_value=self.socket), \
+             patch.object(colima, 'snapshot', return_value=report), \
+             patch.object(colima.subprocess, 'run'), contextlib.redirect_stdout(io.StringIO()) as output:
+            colima.plan([], True)
+        self.assertIn('colima-prune:builder', output.getvalue())
+        self.assertIn('trim only, recovery not guaranteed', output.getvalue())
+
     def test_default_scan_never_starts_stopped_vm(self):
         with patch.object(colima, 'profiles', return_value=self.profile), \
              patch.object(colima, 'profile_root', return_value=self.root), \

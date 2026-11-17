@@ -10,7 +10,7 @@ devclean_emit_artifacts_for_root() {
     devclean_warn "skipping unsafe scan root: $scan_root"
     return 0
   }
-  python3 "$DEVCLEAN_LIB_DIR/inventory.py" projects "$scan_root" "$max_depth" "$age_days" >> "$output_file"
+  python3 "$DEVCLEAN_LIB_DIR/inventory.py" projects "$scan_root" "$max_depth" "$age_days" "${DEVCLEAN_RELEASE_ARTIFACTS:-0}" >> "$output_file"
 }
 
 devclean_deduplicate_plan() {

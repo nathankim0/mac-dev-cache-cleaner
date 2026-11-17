@@ -4,7 +4,7 @@ emulate -L zsh
 setopt extended_glob pipe_fail
 
 typeset -g DEVCLEAN_NAME="clear-dev-caches"
-typeset -g DEVCLEAN_VERSION="0.3.0"
+typeset -g DEVCLEAN_VERSION="0.4.0"
 typeset -g DEVCLEAN_LIB_DIR="${${(%):-%x}:A:h}"
 zmodload zsh/stat
 zmodload zsh/datetime
@@ -76,8 +76,10 @@ devclean_validate_scan_root() {
     /private(|/*))
       local temp_root=""
       [[ -n "${TMPDIR:-}" ]] && temp_root="${TMPDIR:A}"
-      [[ -n "$temp_root" && "$temp_root" == /private/var/folders/*/T(|/) ]] || return 1
-      devclean_path_within "$root" "$temp_root" || return 1
+      if [[ -n "$temp_root" && "$temp_root" == /private/var/folders/*/T(|/) ]] && devclean_path_within "$root" "$temp_root"; then
+        return 0
+      fi
+      python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" private-project-root "$root" || return 1
       ;;
   esac
   return 0
@@ -94,6 +96,10 @@ devclean_validate_delete_target() {
 
   local resolved_path="${target_path:A}"
   local resolved_root="${allowed_root:A}"
+  # Defense in depth for fixture tests: even a discovery regression cannot mutate real data.
+  if [[ -n "${DEVCLEAN_TEST_MUTATION_ROOT:-}" ]]; then
+    devclean_path_within "$resolved_path" "$DEVCLEAN_TEST_MUTATION_ROOT" || return 1
+  fi
   [[ "$resolved_path" == "$target_path" && "$resolved_root" == "$allowed_root" && "$resolved_path" != "$resolved_root" ]] || return 1
   devclean_path_within "$resolved_path" "$resolved_root" || return 1
 
@@ -103,8 +109,9 @@ devclean_validate_delete_target() {
   case "$resolved_path" in
     /|/System(|/*)|/bin(|/*)|/sbin(|/*)|/usr(|/*)|/etc(|/*)|/Library(|/*)|/private/var/db(|/*)) return 1 ;;
     /private(|/*))
-      [[ -n "$temp_root" && "$temp_root" == /private/var/folders/*/T(|/) ]] || return 1
-      devclean_path_within "$resolved_root" "$temp_root" || return 1
+      if ! { [[ -n "$temp_root" && "$temp_root" == /private/var/folders/*/T(|/) ]] && devclean_path_within "$resolved_root" "$temp_root"; }; then
+        python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" private-project-root "$resolved_root" || return 1
+      fi
       ;;
   esac
   case "$resolved_path" in
@@ -151,8 +158,18 @@ devclean_target_is_open() {
     return
   fi
   if (( DEVCLEAN_OPEN_SNAPSHOT )); then
-    [[ -n "${DEVCLEAN_OPEN_PATHS[$target_path]-}" ]]
-    return
+    [[ -n "${DEVCLEAN_OPEN_PATHS[$target_path]-}" ]] && return 0
+    local ancestor="$target_path" native_context=""
+    while [[ "$ancestor" != / ]]; do
+      [[ -n "${DEVCLEAN_OPEN_PATHS[@project:$ancestor]-}" ]] && return 0
+      ancestor="${ancestor:h}"
+    done
+    native_context="$(python3 -B "$DEVCLEAN_LIB_DIR/inventory.py" artifact-context "$target_path")" || return 0
+    while [[ -n "$native_context" && "$native_context" != / ]]; do
+      [[ -n "${DEVCLEAN_OPEN_PATHS[@project:$native_context]-}" ]] && return 0
+      native_context="${native_context:h}"
+    done
+    return 1
   fi
   devclean_command_exists lsof || return 0
   if [[ -d "$target_path" ]]; then

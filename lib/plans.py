@@ -8,6 +8,7 @@ import stat
 import sys
 
 from inventory import ARTIFACTS, SHARED_PATHS, allowed_temp_root, home, protected, recordable, within
+import extra_artifacts
 
 SCHEMA = 'clear-dev-caches-plan-v1'
 MAX_BYTES = 64 * 1024 * 1024
@@ -24,6 +25,8 @@ def row_is_valid(row):
         return False
     h = home()
     if action == 'path':
+        if category in ('native-cache', 'release-output'):
+            return extra_artifacts.kind(path) == category and state in ('recent', 'old')
         if category == 'projects':
             return path.name in ARTIFACTS
         if category == 'shared':
@@ -39,6 +42,10 @@ def row_is_valid(row):
     if category == 'android-avd' and action == 'wipe-avd':
         return (path.parent == root == h / '.android/avd' and path.suffix == '.avd'
                 and len(row) == 8 and bool(re.fullmatch(r'[0-9a-f]{64}', row[7])))
+    if category == 'ios-simulator' and action == 'erase-ios':
+        return (path.parent == root == h / 'Library/Developer/CoreSimulator/Devices'
+                and bool(re.fullmatch(r'[0-9A-Fa-f]{8}(?:-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}', path.name))
+                and state == 'selected-shutdown' and len(row) == 8 and bool(re.fullmatch(r'[0-9a-f]{64}', row[7])))
     if category == 'android-sdk' and action.startswith('sdkmanager:'):
         package = action.removeprefix('sdkmanager:').split(';')
         return (len(package) in (2, 4) and package[0] in ('ndk', 'system-images')

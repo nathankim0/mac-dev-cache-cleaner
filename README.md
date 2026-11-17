@@ -143,3 +143,34 @@ Contributions that weaken scan-first behavior, path validation, or preservation 
 ## License
 
 MIT
+
+### Completed mobile builds and agent scratch space
+
+`--temp-projects` also discovers the current user's owned `/private/tmp/claude-<uid>` and Hermes profile scratch roots. Another user's directory, symlinks, and unrelated `/private` paths remain refused. Native Gradle intermediate/generated folders and `.cxx` are recognized from Gradle markers; generated image resources no longer cause every intermediate to be retained. Custom Xcode DerivedData is recognized from `info.plist` and its build layout, not from names such as `dd` alone. Dependency checkouts and original sources remain outside the selected build children.
+
+Gradle `build/outputs` is shown as `release-review (skip)` until `--release-artifacts` is explicit. Use it only for completed releases, review the exact files, then approve the saved plan. Arbitrary screenshots and source copies are not classified as disposable solely because they are under a temporary folder.
+
+```sh
+clear-dev-caches scan --temp-projects --include-recent --permanent --save-plan "$TMPDIR/agent-builds.json"
+clear-dev-caches scan --root "$HOME/finished-app" --projects --release-artifacts --include-recent --permanent --save-plan "$TMPDIR/finished-builds.json"
+```
+
+Open source files and working directories protect their project's unopened caches too. Scan marks them `in-use (skip)`; cleanup refreshes this protection. This does not prove that an idle or unidentified session is finished: explicitly exclude those roots during review.
+
+### Reuse and inspect simulator devices
+
+Reuse existing idle iPhone and Android devices before creating an app-specific device. Do not interrupt another task's device. iOS device data is an explicit category, separate from `--all`:
+
+```sh
+clear-dev-caches scan --ios-simulator-data
+# Select an existing shutdown device UUID from xcrun simctl list devices:
+clear-dev-caches scan --simulator <UUID> --save-plan "$TMPDIR/ios-reset.json"
+# After approval of app/login/test-data loss on that exact device:
+clear-dev-caches clean --plan "$TMPDIR/ios-reset.json" --user-approved
+```
+
+The first command only measures devices; no UUID is selected implicitly. Cleanup checks state, ownership, open files and the saved data identity again, then uses `simctl erase`. Device definitions and OS runtimes remain. Booted, changed or unselected devices are preserved. Inspect test-manager recordings as well as installed apps when one device grows unusually large.
+
+An inspected Colima VM with no unused Docker objects may still offer a trim-only plan. It does not delete volumes or recreate the VM. Docker estimates, guest filesystem usage, host VM allocation and actual Mac free-space changes are different measurements; no reclaimed bytes are promised from trim alone.
+
+Tests override HOME and stay inside an owned fixture tree. Real-user scratch discovery is disabled when HOME differs from the account's registered home. The shell suite additionally exports a mutation boundary, so even a discovery regression cannot remove paths outside its fixture. Run `zsh tests/run.zsh`; do not run destructive tests against personal project folders.

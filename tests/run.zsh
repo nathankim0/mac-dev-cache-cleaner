@@ -8,6 +8,7 @@ typeset cli="$repo_dir/bin/clear-dev-caches"
 typeset fixture_root
 fixture_root="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/devclean-tests.XXXXXX")" || exit 1
 fixture_root="${fixture_root:A}"
+export DEVCLEAN_TEST_MUTATION_ROOT="$fixture_root"
 typeset fixture_home="$fixture_root/home"
 integer passed=0
 integer failed=0

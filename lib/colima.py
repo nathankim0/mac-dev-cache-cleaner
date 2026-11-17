@@ -129,7 +129,10 @@ def plan(names, inspect_stopped):
             metadata = json.dumps({'status': status, 'fingerprint': report['fingerprint']}, separators=(',', ':'))
             state = (f"{report['images']} images, {report['stopped']} stopped, {report['build_cache']} build cache; "
                      f'{allocated / 1048576:.2f} GiB on Mac')
-            action = 'colima-prune:' + name if report['images'] or report['stopped'] or report['build_cache'] else 'skip'
+            # A previously pruned VM can still retain allocated free blocks.
+            action = 'colima-prune:' + name if allocated or report['images'] or report['stopped'] or report['build_cache'] else 'skip'
+            if not (report['images'] or report['stopped'] or report['build_cache']):
+                state += '; trim only, recovery not guaranteed'
             print('colima', state, report['estimated_kib'], root, root.parent, identity(root.lstat()), action, metadata, sep='\t')
         except (OSError, ValueError, RuntimeError, KeyError, subprocess.CalledProcessError) as error:
             print(f'warning: could not inspect Colima profile {name}: {error}', file=sys.stderr)

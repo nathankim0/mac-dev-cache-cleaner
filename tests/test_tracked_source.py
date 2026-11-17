@@ -4,10 +4,12 @@ import importlib.util
 import io
 import pathlib
 import subprocess
+import sys
 import tempfile
 import unittest
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'lib'))
 spec = importlib.util.spec_from_file_location('inventory', ROOT / 'lib/inventory.py')
 inventory = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(inventory)
